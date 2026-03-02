@@ -143,7 +143,7 @@ class TextOutputRoutingTests(unittest.TestCase):
         with patch(
             "vibemouse.output.subprocess.Popen",
             return_value=SimpleNamespace(),
-        ) as popen_mock:
+        ) as popen_mock, patch("vibemouse.output.shutil.which", return_value=None):
             route = subject.send_to_openclaw("hello")
             detail = subject.send_to_openclaw_result("hello")
 
@@ -164,7 +164,7 @@ class TextOutputRoutingTests(unittest.TestCase):
         with patch(
             "vibemouse.output.subprocess.Popen",
             return_value=SimpleNamespace(),
-        ) as popen_mock:
+        ) as popen_mock, patch("vibemouse.output.shutil.which", return_value=None):
             route = subject.send_to_openclaw("hello")
 
         self.assertEqual(route, "openclaw")
@@ -262,12 +262,39 @@ class TextOutputRoutingTests(unittest.TestCase):
         def fake_copy(text: str) -> None:
             copied.append(text)
 
-        with patch("vibemouse.output.pyperclip.copy", side_effect=fake_copy):
+        with (
+            patch.dict("os.environ", {"VIBEMOUSE_FORCE_PASTE_ASCII": "false"}),
+            patch("vibemouse.output.pyperclip.copy", side_effect=fake_copy),
+        ):
             route = subject.inject_or_clipboard("  hello  ", auto_paste=False)
 
         self.assertEqual(route, "clipboard")
         self.assertEqual(copied, ["hello"])
         self.assertEqual(keyboard.events, [])
+
+    def test_ascii_text_uses_paste_even_when_focused(self) -> None:
+        subject = self._make_subject()
+        keyboard = _FakeKeyboardController()
+        self._bind_keyboard(subject, keyboard)
+        setattr(subject, "_is_text_input_focused", lambda: True)
+
+        with (
+            patch.dict("os.environ", {"VIBEMOUSE_FORCE_PASTE_ASCII": "true"}),
+            patch("vibemouse.output.pyperclip.copy") as copy_mock,
+        ):
+            route = subject.inject_or_clipboard("hello world", auto_paste=False)
+
+        self.assertEqual(route, "pasted")
+        self.assertEqual(copy_mock.call_count, 1)
+        self.assertEqual(
+            keyboard.events,
+            [
+                ("press", "CTRL"),
+                ("press", "v"),
+                ("release", "v"),
+                ("release", "CTRL"),
+            ],
+        )
 
     def test_auto_paste_route_uses_ctrl_v(self) -> None:
         subject = self._make_subject()

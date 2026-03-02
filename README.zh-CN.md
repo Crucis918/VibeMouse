@@ -70,32 +70,46 @@ export VIBEMOUSE_DEVICE=cpu
 vibemouse
 ```
 
-### 一键自动部署（推荐）
+## 快速开始（Windows 10/11）
 
-```bash
-bash scripts/auto-deploy.sh --preset stable
+### 安装
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip install -U pip setuptools wheel
+.\.venv\Scripts\python -m pip install -e .
 ```
 
-这个命令会自动完成 `.venv` 初始化、安装 VibeMouse、生成 service/env 文件、
-启用 `systemd --user` 服务并执行 `vibemouse doctor`。
+### 运行（本地低延迟预设）
 
-可选预设：
-- `stable`：日常稳定均衡
-- `fast`：更低去抖 + 更高 OpenClaw 重试
-- `low-resource`：更低后台资源占用
-
-示例：
-
-```bash
-# 稳定档
-bash scripts/auto-deploy.sh --preset stable
-
-# 低资源档
-bash scripts/auto-deploy.sh --preset low-resource
-
-# 指定你自己的 OpenClaw 助手
-bash scripts/auto-deploy.sh --preset stable --openclaw-agent ops
+```powershell
+$env:VIBEMOUSE_BACKEND="funasr_onnx"
+$env:VIBEMOUSE_DEVICE="cpu"
+$env:VIBEMOUSE_PREWARM_ON_START="true"
+.\.venv\Scripts\vibemouse run
 ```
+
+一键启动脚本：
+
+```powershell
+.\scripts\run-win.ps1
+```
+
+### 构建安装器 EXE（双击安装）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-win-installer.ps1
+```
+
+构建完成后，安装包路径为 `dist\VibeMouse-Setup.exe`。
+
+安装器行为：
+- 托盘常驻运行（无控制台窗口）
+- 自动写入开机启动（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`）
+- 托盘菜单支持 Start/Stop/Restart/Quit
+- 卸载时清理 `%LOCALAPPDATA%\VibeMouse`
+- 首次启动引导会检查麦克风并提示侧键映射
+- 用户配置文件：`%LOCALAPPDATA%\VibeMouse\vibemouse.env`
 
 ## 默认映射与状态逻辑
 

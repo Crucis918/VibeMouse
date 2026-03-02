@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Protocol, cast
 
+from vibemouse.audio import AudioRecorder
 from vibemouse.config import AppConfig, load_config
+from vibemouse.transcriber import SenseVoiceTranscriber
+
+
+class _EdgeCommunicate(Protocol):
+    async def save(self, output: str) -> None: ...
+
+
+class _EdgeCommunicateCtor(Protocol):
+    def __call__(self, text: str, voice: str) -> _EdgeCommunicate: ...
 
 
 @dataclass(frozen=True)
@@ -46,67 +62,144 @@ def run_doctor(*, apply_fixes: bool = False) -> int:
     return 1 if fail_count else 0
 
 
-def _apply_doctor_fixes() -> None:
-    _fix_hyprland_return_bind_conflict()
-    _ensure_user_service_active()
+def run_selftest() -> int:
+    config_check, config = _check_config_load()
+    log_path = _resolve_selftest_log_path()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    with log_path.open("a", encoding="utf-8") as log_fp:
+        _selftest_log(log_fp, "=" * 70)
+        _selftest_log(log_fp, f"{datetime.now().isoformat()} VibeMouse selftest")
+        _selftest_log(log_fp, f"config: {config_check.status} - {config_check.detail}")
+
+        if config is None:
+            _selftest_log(log_fp, "selftest failed: config unavailable")
+            print(f"Selftest log: {log_path}")
+            return 1
+
+        mic_ok, mic_detail = _selftest_microphone_open(config)
+        _selftest_log(log_fp, f"microphone: {'ok' if mic_ok else 'fail'} - {mic_detail}")
+
+        with tempfile.TemporaryDirectory(prefix="vibemouse-selftest-") as tmp:
+            tmp_dir = Path(tmp)
+            tts_ok, mp3_path, tts_detail = _selftest_generate_edge_tts(tmp_dir)
+            _selftest_log(log_fp, f"edge-tts: {'ok' if tts_ok else 'fail'} - {tts_detail}")
+
+            asr_ok = False
+            asr_detail = "skipped: edge-tts failed"
+            if tts_ok and mp3_path is not None:
+                asr_ok, asr_detail = _selftest_transcribe_file(config, mp3_path)
+            _selftest_log(log_fp, f"asr: {'ok' if asr_ok else 'fail'} - {asr_detail}")
+
+        overall_ok = mic_ok and tts_ok and asr_ok
+        _selftest_log(log_fp, f"result: {'PASS' if overall_ok else 'FAIL'}")
+
+    print(f"Selftest log: {log_path}")
+    return 0 if overall_ok else 1
 
 
-def _fix_hyprland_return_bind_conflict() -> None:
-    bind_path = Path.home() / ".config/hypr/UserConfigs/UserKeybinds.conf"
-    if not bind_path.exists():
-        return
+def _resolve_selftest_log_path() -> Path:
+    local_app_data = Path(os.getenv("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
+    return local_app_data / "VibeMouse" / "logs" / "vibemouse-selftest.log"
+
+
+def _selftest_log(log_fp: object, message: str) -> None:
+    try:
+        stream = getattr(sys, "stdout", None)
+        write = getattr(stream, "write", None)
+        flush_console = getattr(stream, "flush", None)
+        if callable(write):
+            try:
+                write(message + "\n")
+            except UnicodeEncodeError:
+                write(message.encode("ascii", errors="replace").decode("ascii") + "\n")
+        if callable(flush_console):
+            flush_console()
+    except Exception:
+        pass
+    write = getattr(log_fp, "write", None)
+    flush = getattr(log_fp, "flush", None)
+    if callable(write):
+        _ = write(message + "\n")
+    if callable(flush):
+        flush()
+
+
+def _selftest_microphone_open(config: AppConfig) -> tuple[bool, str]:
+    recorder = AudioRecorder(
+        sample_rate=config.sample_rate,
+        channels=config.channels,
+        dtype=config.dtype,
+        temp_dir=config.temp_dir,
+    )
+    try:
+        recorder.start()
+        time.sleep(0.35)
+        recorder.cancel()
+        return True, "microphone stream opened and closed successfully"
+    except Exception as error:
+        return False, f"failed to open microphone stream: {error}"
+
+
+def _selftest_generate_edge_tts(tmp_dir: Path) -> tuple[bool, Path | None, str]:
+    try:
+        edge_tts = importlib.import_module("edge_tts")
+    except Exception as error:
+        return (
+            False,
+            None,
+            "edge-tts not installed; run: pip install edge-tts " + f"({error})",
+        )
+
+    voice = os.getenv("VIBEMOUSE_SELFTEST_VOICE", "zh-CN-XiaoxiaoNeural")
+    text = os.getenv("VIBEMOUSE_SELFTEST_TEXT", "你好，这是 VibeMouse 语音自检。")
+    out_path = tmp_dir / "selftest-edge-tts.mp3"
+
+    communicate_ctor_obj = getattr(edge_tts, "Communicate", None)
+    communicate_ctor = cast(_EdgeCommunicateCtor | None, communicate_ctor_obj)
+    if not callable(communicate_ctor):
+        return False, None, "edge-tts Communicate API unavailable"
+
+    async def _save() -> None:
+        communicate = cast(_EdgeCommunicate, communicate_ctor(text, voice))
+        await communicate.save(str(out_path))
 
     try:
-        lines = bind_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return
+        asyncio.run(_save())
+    except Exception as error:
+        return False, None, f"edge-tts synthesis failed: {error}"
 
-    changed = False
-    rewritten: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if (
-            stripped.startswith("#")
-            or "sendshortcut" not in stripped
-            or "Return" not in stripped
-        ):
-            rewritten.append(line)
-            continue
+    if not out_path.exists():
+        return False, None, "edge-tts finished but output mp3 was not created"
 
-        if "mouse:275" in stripped or "mouse:276" in stripped:
-            rewritten.append(f"# {line} # auto-disabled by vibemouse doctor --fix")
-            changed = True
-            continue
+    size = out_path.stat().st_size
+    if size <= 0:
+        return False, None, "edge-tts produced an empty mp3 file"
 
-        rewritten.append(line)
+    return True, out_path, f"generated {out_path.name} ({size} bytes)"
 
-    if not changed:
-        return
 
+def _selftest_transcribe_file(config: AppConfig, audio_path: Path) -> tuple[bool, str]:
+    os.environ.setdefault("VIBEMOUSE_BACKEND", "funasr_onnx")
+    transcriber = SenseVoiceTranscriber(config)
     try:
-        bind_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-    except OSError:
-        return
+        text = transcriber.transcribe(audio_path)
+    except Exception as error:
+        return False, f"transcription failed: {error}"
 
-    _ = _run_subprocess(
-        ["hyprctl", "reload", "config-only"],
-        timeout=3.0,
-    )
+    normalized = text.strip()
+    if not normalized:
+        return False, "transcription returned empty text"
 
-
-def _ensure_user_service_active() -> None:
-    probe = _run_subprocess(
-        ["systemctl", "--user", "is-active", "vibemouse.service"],
-        timeout=3.0,
-    )
-    if probe is None:
-        return
-    if probe.returncode == 0 and probe.stdout.strip() == "active":
-        return
-
-    _ = _run_subprocess(
-        ["systemctl", "--user", "restart", "vibemouse.service"],
-        timeout=8.0,
+    preview = normalized.replace("\n", " ")
+    if len(preview) > 120:
+        preview = preview[:120] + "..."
+    return (
+        True,
+        f"backend={transcriber.backend_in_use}, device={transcriber.device_in_use}, text={preview}",
     )
 
 
@@ -182,7 +275,11 @@ def _check_openclaw(config: AppConfig) -> list[DoctorCheck]:
         )
         return checks
 
-    probe_cmd = [*command_parts, "agents", "list", "--json"]
+    probe_prefix = [*command_parts]
+    if sys.platform.startswith("win") and resolved.lower().endswith((".cmd", ".bat")):
+        probe_prefix = ["cmd", "/c", resolved, *command_parts[1:]]
+
+    probe_cmd = [*probe_prefix, "agents", "list", "--json"]
     try:
         probe = subprocess.run(
             probe_cmd,
@@ -510,6 +607,13 @@ def _to_float(value: object) -> float:
 
 
 def _check_hyprland_return_bind_conflict(config: AppConfig | None) -> DoctorCheck:
+    if not sys.platform.startswith("linux"):
+        return DoctorCheck(
+            name="hyprland-bind-conflict",
+            status="warn",
+            detail="hyprland bind conflict check is only available on Linux",
+        )
+
     bind_path = Path.home() / ".config/hypr/UserConfigs/UserKeybinds.conf"
     if not bind_path.exists():
         return DoctorCheck(
@@ -544,11 +648,22 @@ def _check_hyprland_return_bind_conflict(config: AppConfig | None) -> DoctorChec
 
 
 def _check_user_service_state() -> DoctorCheck:
-    probe = _run_subprocess(
-        ["systemctl", "--user", "is-active", "vibemouse.service"],
-        timeout=3.0,
-    )
-    if probe is None:
+    if not sys.platform.startswith("linux"):
+        return DoctorCheck(
+            name="user-service",
+            status="warn",
+            detail="user service check is only available on Linux",
+        )
+
+    try:
+        probe = subprocess.run(
+            ["systemctl", "--user", "is-active", "vibemouse.service"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
         return DoctorCheck(
             name="user-service",
             status="warn",

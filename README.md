@@ -65,42 +65,56 @@ pip install -e .
 ### Run
 
 ```bash
-export VIBEMOUSE_BACKEND=auto
+export VIBEMOUSE_BACKEND=funasr_onnx
 export VIBEMOUSE_DEVICE=cpu
 vibemouse
 ```
 
-### One-command auto deploy (recommended)
+## Quick Start (Windows 10/11)
 
-```bash
-bash scripts/auto-deploy.sh --preset stable
+### Install
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip install -U pip setuptools wheel
+.\.venv\Scripts\python -m pip install -e .
 ```
 
-This command bootstraps `.venv`, installs VibeMouse, generates service/env files,
-enables `systemd --user` service, and runs `vibemouse doctor`.
+### Run (local low-latency preset)
 
-Available presets:
-- `stable`: balanced daily-driver defaults
-- `fast`: lower debounce + higher OpenClaw retries
-- `low-resource`: lower background footprint defaults
-
-Examples:
-
-```bash
-# High reliability profile
-bash scripts/auto-deploy.sh --preset stable
-
-# Keep resources low
-bash scripts/auto-deploy.sh --preset low-resource
-
-# Custom OpenClaw target assistant
-bash scripts/auto-deploy.sh --preset stable --openclaw-agent ops
+```powershell
+$env:VIBEMOUSE_BACKEND="funasr_onnx"
+$env:VIBEMOUSE_DEVICE="cpu"
+$env:VIBEMOUSE_PREWARM_ON_START="true"
+.\.venv\Scripts\vibemouse run
 ```
+
+One-command launcher:
+
+```powershell
+.\scripts\run-win.ps1
+```
+
+### Build installer EXE (double-click install)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-win-installer.ps1
+```
+
+After completion, installer is generated at `dist\VibeMouse-Setup.exe`.
+
+Installer behavior:
+- Runs as tray app (no console window)
+- Registers startup entry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+- Tray menu supports Start/Stop/Restart/Quit
+- Uninstall cleans `%LOCALAPPDATA%\VibeMouse`
+- First launch guide checks microphone and side-button mapping
+- User config file: `%LOCALAPPDATA%\VibeMouse\vibemouse.env`
 
 ## Default Mapping and State Logic
 
-- `VIBEMOUSE_FRONT_BUTTON` default: `x1`
-- `VIBEMOUSE_REAR_BUTTON` default: `x2`
+- `VIBEMOUSE_FRONT_BUTTON` default: `x2`
+- `VIBEMOUSE_REAR_BUTTON` default: `x1`
 
 State matrix:
 - Idle + rear press -> Enter (`VIBEMOUSE_ENTER_MODE`)

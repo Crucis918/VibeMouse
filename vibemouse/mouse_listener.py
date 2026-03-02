@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -64,6 +66,10 @@ class SideButtonListener:
         self._gesture_grabbed_device: _EvdevDevice | None = None
         self._stop: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._suppress_system_side_buttons: bool = (
+            os.getenv("VIBEMOUSE_SUPPRESS_SYSTEM_SIDE_BUTTONS", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -79,6 +85,10 @@ class SideButtonListener:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
+        if sys.platform.startswith("win"):
+            self._run_windows()
+            return
+
         last_error_summary: str | None = None
         while not self._stop.is_set():
             try:
@@ -98,6 +108,20 @@ class SideButtonListener:
                         last_error_summary = summary
                     if self._stop.wait(1.0):
                         return
+
+    def _run_windows(self) -> None:
+        last_error_summary: str | None = None
+        while not self._stop.is_set():
+            try:
+                self._run_pynput()
+                return
+            except Exception as pynput_error:
+                summary = f"Mouse listener backend unavailable (pynput: {pynput_error}). Retrying..."
+                if summary != last_error_summary:
+                    print(summary)
+                    last_error_summary = summary
+                if self._stop.wait(1.0):
+                    return
 
     def _run_evdev(self) -> None:
         import select
@@ -210,15 +234,62 @@ class SideButtonListener:
         listener_ctor = cast(_MouseListenerCtor, getattr(mouse_module, "Listener"))
 
         button_map = {
-            "x1": {"x1", "x_button1", "button8"},
-            "x2": {"x2", "x_button2", "button9"},
+            "x1": {
+                "x1",
+                "x_button1",
+                "xbutton1",
+                "button8",
+                "button6",
+                "button4",
+                "back",
+            },
+            "x2": {
+                "x2",
+                "x_button2",
+                "xbutton2",
+                "button9",
+                "button7",
+                "button5",
+                "forward",
+            },
         }
 
         front_candidates = button_map[self._front_button]
         rear_candidates = button_map[self._rear_button]
         right_candidates = {"right", "button2"}
+        listener_holder: dict[str, object] = {}
+        last_win32_dispatch_monotonic: list[float] = [0.0]
+
+        def win32_event_filter(msg: int, data: object) -> None:
+            if not sys.platform.startswith("win") or not self._suppress_system_side_buttons:
+                return
+
+            if msg not in {0x020B, 0x020C, 0x00AB, 0x00AC}:
+                return
+
+            mouse_data = int(getattr(data, "mouseData", 0))
+            x_button = (mouse_data >> 16) & 0xFFFF
+            if x_button not in {1, 2}:
+                return
+
+            if msg in {0x020B, 0x00AB}:
+                configured_x_button = 1 if self._front_button == "x1" else 2
+                button_label = "front" if x_button == configured_x_button else "rear"
+                self._dispatch_click(button_label)
+                last_win32_dispatch_monotonic[0] = time.monotonic()
+
+            listener_obj = listener_holder.get("listener")
+            suppress_event = getattr(listener_obj, "suppress_event", None)
+            if callable(suppress_event):
+                suppress_event()
 
         def on_click(x: int, y: int, button: object, pressed: bool) -> None:
+            if (
+                pressed
+                and time.monotonic() - last_win32_dispatch_monotonic[0] < 0.05
+            ):
+                return
+
             btn_name = str(button).lower().split(".")[-1]
             button_label: str | None = None
             if btn_name in front_candidates:
@@ -246,7 +317,15 @@ class SideButtonListener:
                 return
             self._accumulate_gesture_position(x, y)
 
-        listener = listener_ctor(on_click=on_click, on_move=on_move)
+        try:
+            listener = listener_ctor(
+                on_click=on_click,
+                on_move=on_move,
+                win32_event_filter=win32_event_filter,
+            )
+        except TypeError:
+            listener = listener_ctor(on_click=on_click, on_move=on_move)
+        listener_holder["listener"] = listener
         listener.start()
         try:
             while not self._stop.is_set():
@@ -501,6 +580,8 @@ class _MouseListener(Protocol):
 
     def stop(self) -> None: ...
 
+    def suppress_event(self) -> None: ...
+
 
 class _MouseListenerCtor(Protocol):
     def __call__(
@@ -508,4 +589,5 @@ class _MouseListenerCtor(Protocol):
         *,
         on_click: Callable[[int, int, object, bool], None],
         on_move: Callable[[int, int], None] | None = None,
+        win32_event_filter: Callable[[int, object], None] | None = None,
     ) -> _MouseListener: ...

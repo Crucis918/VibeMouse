@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import shutil
 import shlex
 import subprocess
 import time
@@ -86,18 +88,45 @@ class TextOutput:
         if not normalized:
             return "empty"
 
-        if self._is_text_input_focused():
+        copied = False
+        try:
+            pyperclip.copy(normalized)
+            copied = True
+        except Exception:
+            copied = False
+
+        force_paste_for_ascii = os.getenv("VIBEMOUSE_FORCE_PASTE_ASCII", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if self._is_text_input_focused() and not (
+            force_paste_for_ascii and self._looks_like_ascii_phrase(normalized)
+        ):
             self._kb.type(normalized)
             return "typed"
 
-        pyperclip.copy(normalized)
-        if auto_paste:
+        if not copied:
+            pyperclip.copy(normalized)
+        if auto_paste or (force_paste_for_ascii and self._looks_like_ascii_phrase(normalized)):
             try:
                 self._paste_clipboard()
                 return "pasted"
             except Exception:
                 return "clipboard"
         return "clipboard"
+
+    @staticmethod
+    def _looks_like_ascii_phrase(text: str) -> bool:
+        if not text:
+            return False
+        try:
+            text.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        alnum_count = sum(1 for ch in text if ch.isalnum())
+        return alnum_count >= 2
 
     def send_to_openclaw(self, text: str) -> str:
         return self.send_to_openclaw_result(text).route
@@ -151,7 +180,17 @@ class TextOutput:
         if not parts:
             return None
 
-        command = [*parts, "agent", "--message", message, "--json"]
+        command_prefix = [*parts]
+        if os.name == "nt":
+            executable = parts[0]
+            resolved = shutil.which(executable)
+            if resolved:
+                executable = resolved
+            lowered = executable.lower()
+            if lowered.endswith(".cmd") or lowered.endswith(".bat"):
+                command_prefix = ["cmd", "/c", *parts]
+
+        command = [*command_prefix, "agent", "--message", message, "--json"]
         agent = getattr(self, "_openclaw_agent", None)
         if isinstance(agent, str):
             normalized_agent = agent.strip()

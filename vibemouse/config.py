@@ -88,6 +88,7 @@ class AppConfig:
     merge_length_s: int
     fallback_to_cpu: bool
     button_debounce_ms: int
+    stop_delay_ms: int
     gestures_enabled: bool
     gesture_trigger_button: str
     gesture_threshold_px: int
@@ -101,7 +102,7 @@ class AppConfig:
     auto_paste: bool
     trust_remote_code: bool
     prewarm_on_start: bool
-    prewarm_delay_s: float
+    keep_recordings: bool
     status_file: Path
     openclaw_command: str
     openclaw_agent: str | None
@@ -140,6 +141,10 @@ def load_config() -> AppConfig:
     button_debounce_ms = _require_non_negative(
         "VIBEMOUSE_BUTTON_DEBOUNCE_MS",
         _read_int("VIBEMOUSE_BUTTON_DEBOUNCE_MS", 150),
+    )
+    stop_delay_ms = _require_non_negative(
+        "VIBEMOUSE_STOP_DELAY_MS",
+        _read_int("VIBEMOUSE_STOP_DELAY_MS", 220),
     )
     gestures_enabled = _read_bool("VIBEMOUSE_GESTURES_ENABLED", False)
     gesture_trigger_button = _read_choice(
@@ -218,6 +223,7 @@ def load_config() -> AppConfig:
         merge_length_s=merge_length_s,
         fallback_to_cpu=_read_bool("VIBEMOUSE_FALLBACK_CPU", True),
         button_debounce_ms=button_debounce_ms,
+        stop_delay_ms=stop_delay_ms,
         gestures_enabled=gestures_enabled,
         gesture_trigger_button=gesture_trigger_button,
         gesture_threshold_px=gesture_threshold_px,
@@ -231,7 +237,7 @@ def load_config() -> AppConfig:
         auto_paste=_read_bool("VIBEMOUSE_AUTO_PASTE", False),
         trust_remote_code=_read_bool("VIBEMOUSE_TRUST_REMOTE_CODE", False),
         prewarm_on_start=_read_bool("VIBEMOUSE_PREWARM_ON_START", True),
-        prewarm_delay_s=prewarm_delay_s,
+        keep_recordings=_read_bool("VIBEMOUSE_KEEP_RECORDINGS", False),
         status_file=status_file,
         openclaw_command=openclaw_command,
         openclaw_agent=openclaw_agent,
