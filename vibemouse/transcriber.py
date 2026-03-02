@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import os
+import re
+import tempfile
 from pathlib import Path
 from threading import Lock
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from vibemouse.config import AppConfig
 
@@ -38,165 +41,25 @@ class SenseVoiceTranscriber:
                 self._build_auto_backend()
                 return
 
-            if backend == "funasr":
-                self._build_funasr_backend()
-                return
-
             if backend == "funasr_onnx":
                 self._build_funasr_onnx_backend()
                 return
 
             raise RuntimeError(
-                f"Unsupported backend {backend!r}. Use auto, funasr, or funasr_onnx."
+                f"Unsupported backend {backend!r}. Use auto or funasr_onnx."
             )
 
     def _build_auto_backend(self) -> None:
-        errors: list[str] = []
-
-        if self._looks_like_intel_npu_device(self._config.device):
-            try:
-                self._build_funasr_onnx_backend()
-                return
-            except Exception as error:
-                errors.append(f"funasr_onnx: {error}")
-                try:
-                    self._build_funasr_backend()
-                    return
-                except Exception as fallback_error:
-                    errors.append(f"funasr: {fallback_error}")
-
-        else:
-            try:
-                self._build_funasr_backend()
-                return
-            except Exception as error:
-                errors.append(f"funasr: {error}")
-                try:
-                    self._build_funasr_onnx_backend()
-                    return
-                except Exception as fallback_error:
-                    errors.append(f"funasr_onnx: {fallback_error}")
-
-        raise RuntimeError(
-            "Failed to initialize any transcriber backend. " + " | ".join(errors)
-        )
-
-    def _build_funasr_backend(self) -> None:
-        backend = _FunASRBackend(self._config)
-        self._transcriber = backend
-        self.device_in_use = backend.device_in_use
-        self.backend_in_use = "funasr"
+        try:
+            self._build_funasr_onnx_backend()
+        except Exception as error:
+            raise RuntimeError(f"Failed to initialize ONNX backend: {error}") from error
 
     def _build_funasr_onnx_backend(self) -> None:
         backend = _FunASRONNXBackend(self._config)
         self._transcriber = backend
         self.device_in_use = backend.device_in_use
         self.backend_in_use = "funasr_onnx"
-
-    @staticmethod
-    def _looks_like_intel_npu_device(device: str) -> bool:
-        normalized = device.strip().lower()
-        return normalized.startswith("npu") or normalized.startswith("openvino:npu")
-
-
-class _FunASRBackend:
-    def __init__(self, config: AppConfig) -> None:
-        self._config: AppConfig = config
-        self._model: _SenseModel | None = None
-        self._postprocess: _PostprocessFn | None = None
-        self._load_lock: Lock = Lock()
-        self.device_in_use: str = config.device
-        self._ensure_model_loaded()
-
-    def transcribe(self, audio_path: Path) -> str:
-        if self._model is None:
-            raise RuntimeError("FunASR model is not initialized")
-
-        result = self._model.generate(
-            input=str(audio_path),
-            cache={},
-            language=self._config.language,
-            use_itn=self._config.use_itn,
-            merge_vad=self._config.merge_vad,
-            merge_length_s=self._config.merge_length_s,
-            batch_size_s=60,
-        )
-        if not result:
-            return ""
-
-        text_obj = result[0].get("text", "")
-        if not isinstance(text_obj, str):
-            return ""
-
-        text = text_obj.strip()
-        if self._postprocess is None:
-            return text
-        return self._postprocess(text).strip()
-
-    def _ensure_model_loaded(self) -> None:
-        if self._model is not None:
-            return
-        with self._load_lock:
-            if self._model is not None:
-                return
-            try:
-                model, postprocess = self._create_model(self._config.device)
-                self._model = model
-                self._postprocess = postprocess
-                self.device_in_use = self._config.device
-                return
-            except Exception as primary_error:
-                if (
-                    not self._config.fallback_to_cpu
-                    or self._config.device.strip().lower() == "cpu"
-                ):
-                    raise RuntimeError(
-                        f"Failed to load FunASR SenseVoice on {self._config.device}: {primary_error}"
-                    ) from primary_error
-
-            try:
-                model, postprocess = self._create_model("cpu")
-            except Exception as cpu_error:
-                raise RuntimeError(
-                    f"Failed to load FunASR SenseVoice on {self._config.device} and cpu fallback: {cpu_error}"
-                ) from cpu_error
-
-            self._model = model
-            self._postprocess = postprocess
-            self.device_in_use = "cpu"
-
-    def _create_model(self, device: str) -> tuple[_SenseModel, _PostprocessFn]:
-        try:
-            funasr_module = importlib.import_module("funasr")
-            postprocess_module = importlib.import_module(
-                "funasr.utils.postprocess_utils"
-            )
-        except Exception as error:
-            raise RuntimeError(
-                "FunASR is not installed or not importable in current environment"
-            ) from error
-
-        auto_model_ctor = cast(_AutoModelCtor, getattr(funasr_module, "AutoModel"))
-        rich_transcription_postprocess = cast(
-            _PostprocessFn,
-            getattr(postprocess_module, "rich_transcription_postprocess"),
-        )
-
-        kwargs: dict[str, object] = {
-            "model": self._config.model_name,
-            "trust_remote_code": self._config.trust_remote_code,
-            "device": device,
-            "disable_update": True,
-        }
-        if self._config.enable_vad:
-            kwargs["vad_model"] = "fsmn-vad"
-            kwargs["vad_kwargs"] = {
-                "max_single_segment_time": self._config.vad_max_single_segment_ms
-            }
-
-        model = auto_model_ctor(**kwargs)
-        return model, rich_transcription_postprocess
-
 
 class _FunASRONNXBackend:
     def __init__(self, config: AppConfig) -> None:
@@ -213,6 +76,12 @@ class _FunASRONNXBackend:
         if self._postprocess is None:
             raise RuntimeError("funasr postprocess function is not initialized")
 
+        chunk_seconds = self._read_chunk_seconds()
+        if chunk_seconds > 0:
+            long_text = self._transcribe_by_chunks(audio_path, chunk_seconds)
+            if long_text is not None:
+                return long_text
+
         textnorm = "withitn" if self._config.use_itn else "woitn"
         result = self._model(
             str(audio_path),
@@ -223,7 +92,105 @@ class _FunASRONNXBackend:
             return ""
 
         raw_text = result[0]
-        return self._postprocess(raw_text).strip()
+        return self._normalize_transcript(self._postprocess(raw_text)).strip()
+
+    def _read_chunk_seconds(self) -> int:
+        raw = os.getenv("VIBEMOUSE_ONNX_CHUNK_S", "14").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return 14
+        if value <= 0:
+            return 0
+        return min(value, 120)
+
+    def _read_chunk_overlap_seconds(self) -> float:
+        raw = os.getenv("VIBEMOUSE_ONNX_CHUNK_OVERLAP_S", "2.0").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return 2.0
+        if value < 0:
+            return 0.0
+        return min(value, 8.0)
+
+    def _transcribe_by_chunks(self, audio_path: Path, chunk_seconds: int) -> str | None:
+        if self._model is None or self._postprocess is None:
+            return None
+
+        try:
+            soundfile_module = importlib.import_module("soundfile")
+            read_fn = cast(_SoundFileReadFn, getattr(soundfile_module, "read"))
+            write_fn = cast(_SoundFileWriteFn, getattr(soundfile_module, "write"))
+            audio_obj, sample_rate = read_fn(str(audio_path), dtype="float32")
+            audio = cast(Any, audio_obj)
+        except Exception:
+            return None
+
+        total_samples = len(audio)
+        if total_samples <= 0:
+            return ""
+
+        chunk_samples = chunk_seconds * sample_rate
+        if chunk_samples <= 0 or total_samples <= chunk_samples:
+            return None
+
+        overlap_samples = int(self._read_chunk_overlap_seconds() * sample_rate)
+        stride_samples = max(1, chunk_samples - overlap_samples)
+
+        textnorm = "withitn" if self._config.use_itn else "woitn"
+        merged_text = ""
+        with tempfile.TemporaryDirectory(prefix="vibemouse-onnx-") as tmp:
+            tmp_dir = Path(tmp)
+            chunk_index = 0
+            start = 0
+            while start < total_samples:
+                end = min(start + chunk_samples, total_samples)
+                segment = audio[start:end]
+                if len(segment) < max(1, sample_rate // 6):
+                    break
+                chunk_path = tmp_dir / f"chunk_{chunk_index:03d}.wav"
+                chunk_index += 1
+                write_fn(str(chunk_path), segment, sample_rate)
+                result = self._model(
+                    str(chunk_path),
+                    language=self._config.language,
+                    textnorm=textnorm,
+                )
+                if not result:
+                    if end >= total_samples:
+                        break
+                    start += stride_samples
+                    continue
+                part = self._postprocess(result[0]).strip()
+                part = self._normalize_transcript(part).strip()
+                if part:
+                    merged_text = self._merge_chunk_text(merged_text, part)
+                if end >= total_samples:
+                    break
+                start += stride_samples
+        return merged_text.strip()
+
+    @staticmethod
+    def _merge_chunk_text(existing: str, incoming: str) -> str:
+        if not existing:
+            return incoming
+        if not incoming:
+            return existing
+        if incoming in existing:
+            return existing
+
+        max_overlap = min(len(existing), len(incoming), 60)
+        overlap = 0
+        for size in range(max_overlap, 0, -1):
+            if existing.endswith(incoming[:size]):
+                overlap = size
+                break
+
+        if overlap > 0:
+            return existing + incoming[overlap:]
+
+        return existing + " " + incoming
 
     def _ensure_model_loaded(self) -> None:
         if self._model is not None:
@@ -237,7 +204,7 @@ class _FunASRONNXBackend:
                 postprocess = self._load_postprocess()
             except Exception as error:
                 raise RuntimeError(
-                    "funasr_onnx backend requires funasr-onnx and funasr packages"
+                    "funasr_onnx backend is not available in current environment"
                 ) from error
 
             requested_path = self._resolve_onnx_model_dir()
@@ -286,7 +253,24 @@ class _FunASRONNXBackend:
             canonical_model = "iic/SenseVoiceSmall-onnx"
 
         if canonical_model.startswith("iic/"):
-            return self._download_modelscope_snapshot(canonical_model)
+            local_cache = (
+                Path.home()
+                / ".cache"
+                / "modelscope"
+                / "hub"
+                / "models"
+                / canonical_model.replace("/", os.sep)
+            )
+            if not local_cache.exists():
+                raise RuntimeError(
+                    f"ONNX model not found locally: {local_cache}. "
+                    + "Please pre-download model iic/SenseVoiceSmall-onnx."
+                )
+            if not self._contains_onnx_model(local_cache):
+                raise RuntimeError(
+                    f"Local ONNX model directory {local_cache} is missing model_quant.onnx/model.onnx"
+                )
+            return local_cache
 
         path_candidate = Path(canonical_model)
         if not path_candidate.exists():
@@ -304,29 +288,6 @@ class _FunASRONNXBackend:
         return (model_dir / "model_quant.onnx").exists() or (
             model_dir / "model.onnx"
         ).exists()
-
-    @staticmethod
-    def _download_modelscope_snapshot(model_id: str) -> Path:
-        try:
-            snapshot_mod = importlib.import_module("modelscope.hub.snapshot_download")
-        except Exception as error:
-            raise RuntimeError(
-                "modelscope is required to download ONNX model snapshots"
-            ) from error
-
-        snapshot_download = cast(
-            _SnapshotDownloadFn,
-            getattr(snapshot_mod, "snapshot_download"),
-        )
-        snapshot_path = snapshot_download(model_id)
-        model_dir = Path(snapshot_path)
-        if not model_dir.exists():
-            raise RuntimeError(f"Downloaded model path does not exist: {snapshot_path}")
-        if not _FunASRONNXBackend._contains_onnx_model(model_dir):
-            raise RuntimeError(
-                f"Downloaded model {model_id} missing model_quant.onnx/model.onnx"
-            )
-        return model_dir
 
     @staticmethod
     def _resolve_onnx_device_id(device: str) -> str:
@@ -370,39 +331,28 @@ class _FunASRONNXBackend:
 
     @staticmethod
     def _load_postprocess() -> _PostprocessFn:
-        post_module = importlib.import_module("funasr.utils.postprocess_utils")
-        return cast(
-            _PostprocessFn,
-            getattr(post_module, "rich_transcription_postprocess"),
-        )
+        try:
+            post_module = importlib.import_module("funasr.utils.postprocess_utils")
+            return cast(
+                _PostprocessFn,
+                getattr(post_module, "rich_transcription_postprocess"),
+            )
+        except Exception:
+            return cast(_PostprocessFn, lambda text: text)
+
+    @staticmethod
+    def _normalize_transcript(text: str) -> str:
+        cleaned = text
+        cleaned = re.sub(r"<\|[^|]*\|>", " ", cleaned)
+        cleaned = cleaned.replace("<||>", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
 
 
 class _TranscriberProtocol(Protocol):
     device_in_use: str
 
     def transcribe(self, audio_path: Path) -> str: ...
-
-
-class _SenseResultItem(Protocol):
-    def get(self, key: str, default: str = "") -> str | object: ...
-
-
-class _SenseModel(Protocol):
-    def generate(
-        self,
-        *,
-        input: str,
-        cache: dict[str, object],
-        language: str,
-        use_itn: bool,
-        merge_vad: bool,
-        merge_length_s: int,
-        batch_size_s: int,
-    ) -> list[_SenseResultItem]: ...
-
-
-class _AutoModelCtor(Protocol):
-    def __call__(self, **kwargs: object) -> _SenseModel: ...
 
 
 class _PostprocessFn(Protocol):
@@ -431,5 +381,9 @@ class _ONNXSenseVoiceCtor(Protocol):
     ) -> _ONNXSenseVoiceModel: ...
 
 
-class _SnapshotDownloadFn(Protocol):
-    def __call__(self, model_id: str) -> str: ...
+class _SoundFileReadFn(Protocol):
+    def __call__(self, file: str, *, dtype: str = "float32") -> tuple[Any, int]: ...
+
+
+class _SoundFileWriteFn(Protocol):
+    def __call__(self, file: str, data: object, samplerate: int) -> None: ...

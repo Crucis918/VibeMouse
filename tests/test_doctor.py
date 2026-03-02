@@ -13,6 +13,10 @@ from vibemouse.doctor import (
     _check_hyprland_return_bind_conflict,
     _check_openclaw,
     _parse_openclaw_command,
+    _selftest_generate_edge_tts,
+    _selftest_transcribe_file,
+    _selftest_microphone_open,
+    run_selftest,
     run_doctor,
 )
 
@@ -69,7 +73,10 @@ class DoctorHelpersTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("vibemouse.doctor.Path.home", return_value=Path(tmp)):
+            with (
+                patch("vibemouse.doctor.sys.platform", "linux"),
+                patch("vibemouse.doctor.Path.home", return_value=Path(tmp)),
+            ):
                 check = _check_hyprland_return_bind_conflict(
                     cast(
                         AppConfig,
@@ -157,3 +164,62 @@ class DoctorCommandTests(unittest.TestCase):
             rc = run_doctor()
 
         self.assertEqual(rc, 1)
+
+    def test_selftest_returns_nonzero_on_failed_config(self) -> None:
+        with patch(
+            "vibemouse.doctor._check_config_load",
+            return_value=(DoctorCheck("config", "fail", "broken"), None),
+        ):
+            rc = run_selftest()
+
+        self.assertEqual(rc, 1)
+
+
+class DoctorSelftestHelpersTests(unittest.TestCase):
+    def test_selftest_microphone_open_success(self) -> None:
+        fake_recorder = SimpleNamespace(start=lambda: None, cancel=lambda: None)
+        config = cast(
+            AppConfig,
+            cast(
+                object,
+                SimpleNamespace(
+                    sample_rate=16000,
+                    channels=1,
+                    dtype="float32",
+                    temp_dir=Path(tempfile.gettempdir()),
+                ),
+            ),
+        )
+        with (
+            patch("vibemouse.doctor.AudioRecorder", return_value=fake_recorder),
+            patch("vibemouse.doctor.time.sleep"),
+        ):
+            ok, detail = _selftest_microphone_open(config)
+
+        self.assertTrue(ok)
+        self.assertIn("opened", detail)
+
+    def test_selftest_generate_edge_tts_missing_dependency(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vibemouse-doctor-tts-") as tmp:
+            with patch(
+                "vibemouse.doctor.importlib.import_module",
+                side_effect=ModuleNotFoundError("edge_tts"),
+            ):
+                ok, path, detail = _selftest_generate_edge_tts(Path(tmp))
+
+        self.assertFalse(ok)
+        self.assertIsNone(path)
+        self.assertIn("edge-tts not installed", detail)
+
+    def test_selftest_transcribe_file_empty_output(self) -> None:
+        config = cast(AppConfig, cast(object, SimpleNamespace()))
+        fake_transcriber = SimpleNamespace(
+            transcribe=lambda _p: "  ",
+            backend_in_use="funasr_onnx",
+            device_in_use="cpu",
+        )
+        with patch("vibemouse.doctor.SenseVoiceTranscriber", return_value=fake_transcriber):
+            ok, detail = _selftest_transcribe_file(config, Path("dummy.mp3"))
+
+        self.assertFalse(ok)
+        self.assertIn("empty", detail)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from vibemouse.config import load_config
@@ -85,14 +86,15 @@ class LoadConfigTests(unittest.TestCase):
         self.assertFalse(config.prewarm_on_start)
 
     def test_status_file_can_be_overridden(self) -> None:
+        expected = Path("/tmp/custom-vibemouse-status.json")
         with patch.dict(
             os.environ,
-            {"VIBEMOUSE_STATUS_FILE": "/tmp/custom-vibemouse-status.json"},
+            {"VIBEMOUSE_STATUS_FILE": str(expected)},
             clear=True,
         ):
             config = load_config()
 
-        self.assertEqual(str(config.status_file), "/tmp/custom-vibemouse-status.json")
+        self.assertEqual(config.status_file.as_posix(), expected.as_posix())
 
     def test_enter_mode_can_be_configured(self) -> None:
         with patch.dict(os.environ, {"VIBEMOUSE_ENTER_MODE": "ctrl_enter"}, clear=True):

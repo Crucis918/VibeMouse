@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import threading
+from collections.abc import Iterable, Mapping
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,14 +32,9 @@ class _AudioStream(Protocol):
 
 
 class _SoundDeviceModule(Protocol):
-    def InputStream(
-        self,
-        *,
-        samplerate: int,
-        channels: int,
-        dtype: str,
-        callback: Callable[[AudioFrame, int, object, object], None],
-    ) -> _AudioStream: ...
+    def InputStream(self, **kwargs: object) -> _AudioStream: ...
+
+    def query_devices(self) -> object: ...
 
 
 class _SoundFileModule(Protocol):
@@ -58,6 +55,8 @@ class AudioRecorder:
         self._frames: list[AudioFrame] = []
         self._stream: _AudioStream | None = None
         self._recording: bool = False
+        self._active_sample_rate: int = sample_rate
+        self._preferred_device_raw: str = os.getenv("VIBEMOUSE_AUDIO_DEVICE", "").strip()
 
     @property
     def is_recording(self) -> bool:
@@ -78,15 +77,11 @@ class AudioRecorder:
             self._frames = []
             if self._sd is None:
                 raise RuntimeError("Audio input module not initialized")
-            stream = self._sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=self._channels,
-                dtype=self._dtype,
-                callback=self._callback,
-            )
+            stream, active_sample_rate = self._open_input_stream_with_fallback()
             stream.start()
             self._stream = stream
             self._recording = True
+            self._active_sample_rate = active_sample_rate
 
     def stop_and_save(self) -> AudioRecording | None:
         with self._lock:
@@ -110,13 +105,216 @@ class AudioRecorder:
         if self._sf is None:
             raise RuntimeError("Audio write module not initialized")
         try:
-            self._sf.write(out_path, audio, self._sample_rate)
+            self._sf.write(out_path, audio, self._active_sample_rate)
         except Exception as error:
             raise RuntimeError(
                 f"Failed to write recording to {out_path}: {error}"
             ) from error
-        duration = float(len(audio) / self._sample_rate)
+        duration = float(len(audio) / self._active_sample_rate)
         return AudioRecording(path=out_path, duration_s=duration)
+
+    def _open_input_stream_with_fallback(self) -> tuple[_AudioStream, int]:
+        if self._sd is None:
+            raise RuntimeError("Audio input module not initialized")
+
+        base_kwargs: dict[str, object] = {
+            "dtype": self._dtype,
+            "callback": self._callback,
+        }
+
+        attempts: list[str] = []
+        last_error: Exception | None = None
+        for candidate in self._build_stream_candidates():
+            kwargs = {
+                **base_kwargs,
+                "samplerate": candidate["sample_rate"],
+                "channels": candidate["channels"],
+            }
+            device = candidate.get("device")
+            if isinstance(device, int):
+                kwargs["device"] = device
+
+            try:
+                stream = self._sd.InputStream(**kwargs)
+                print(
+                    "Audio input opened: "
+                    + f"device={candidate['label']}, sample_rate={candidate['sample_rate']}, channels={candidate['channels']}"
+                )
+                return stream, int(candidate["sample_rate"])
+            except Exception as error:
+                last_error = error
+                attempts.append(
+                    f"{candidate['label']}@{candidate['sample_rate']}Hz/{candidate['channels']}ch: {error}"
+                )
+
+        hint = ""
+        if self._preferred_device_raw:
+            hint = (
+                " Check VIBEMOUSE_AUDIO_DEVICE; current value="
+                + repr(self._preferred_device_raw)
+                + "."
+            )
+        detail = " | ".join(attempts[-6:]) if attempts else "no attempts"
+        raise RuntimeError(
+            "Failed to open any microphone input stream. " + detail + hint
+        ) from last_error
+
+    def _build_stream_candidates(self) -> list[dict[str, object]]:
+        default_rates = [self._sample_rate, 16000, 48000, 44100]
+        candidates: list[dict[str, object]] = []
+
+        for rate in self._unique_positive_ints(default_rates):
+            candidates.append(
+                {
+                    "label": "default",
+                    "sample_rate": rate,
+                    "channels": self._channels,
+                }
+            )
+
+        fallback_configs = self._pick_fallback_input_devices()
+        preferred_index = self._resolve_preferred_device_index(fallback_configs)
+        ordered = fallback_configs
+        if preferred_index is not None:
+            ordered = sorted(
+                fallback_configs,
+                key=lambda item: 0 if item["index"] == preferred_index else 1,
+            )
+
+        for item in ordered:
+            sample_rates = self._unique_positive_ints(
+                [
+                    self._sample_rate,
+                    int(item["sample_rate"]),
+                    16000,
+                    48000,
+                    44100,
+                ]
+            )
+            for rate in sample_rates:
+                candidates.append(
+                    {
+                        "label": f"{item['name']}#{item['index']}",
+                        "device": int(item["index"]),
+                        "sample_rate": rate,
+                        "channels": int(item["channels"]),
+                    }
+                )
+
+        deduped: list[dict[str, object]] = []
+        seen: set[tuple[object, int, int]] = set()
+        for item in candidates:
+            key = (
+                item.get("device"),
+                int(item["sample_rate"]),
+                int(item["channels"]),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _pick_fallback_input_devices(self) -> list[dict[str, object]]:
+        if self._sd is None:
+            return []
+
+        query_devices = getattr(self._sd, "query_devices", None)
+        if not callable(query_devices):
+            return []
+
+        try:
+            devices_obj = query_devices()
+        except Exception:
+            return []
+
+        if not isinstance(devices_obj, Iterable):
+            return []
+
+        devices: list[dict[str, object]] = []
+
+        for index, item in enumerate(devices_obj):
+            if not isinstance(item, Mapping):
+                continue
+
+            max_input = self._to_int(item.get("max_input_channels"), default=0)
+            if max_input <= 0:
+                continue
+
+            sample_rate = self._to_int(
+                item.get("default_samplerate"),
+                default=self._sample_rate,
+            )
+            channels = max(1, min(self._channels, max_input))
+            name_raw = item.get("name")
+            name = str(name_raw).strip() if name_raw is not None else f"device-{index}"
+            devices.append(
+                {
+                    "index": index,
+                    "name": name,
+                    "sample_rate": sample_rate,
+                    "channels": channels,
+                }
+            )
+
+        return devices
+
+    def _resolve_preferred_device_index(
+        self, devices: list[dict[str, object]]
+    ) -> int | None:
+        raw = self._preferred_device_raw
+        if not raw:
+            return None
+
+        try:
+            numeric = int(raw)
+        except ValueError:
+            numeric = None
+
+        if isinstance(numeric, int):
+            for item in devices:
+                if int(item["index"]) == numeric:
+                    return numeric
+
+        lowered = raw.lower()
+        for item in devices:
+            name = str(item.get("name", "")).lower()
+            if lowered and lowered in name:
+                return int(item["index"])
+
+        print(
+            "Preferred microphone not found: "
+            + f"VIBEMOUSE_AUDIO_DEVICE={raw!r}. Falling back to auto selection."
+        )
+        return None
+
+    @staticmethod
+    def _unique_positive_ints(values: list[int]) -> list[int]:
+        output: list[int] = []
+        seen: set[int] = set()
+        for item in values:
+            if item <= 0:
+                continue
+            if item in seen:
+                continue
+            seen.add(item)
+            output.append(item)
+        return output
+
+    @staticmethod
+    def _to_int(value: object, *, default: int) -> int:
+        if isinstance(value, int):
+            return value if value > 0 else default
+        if isinstance(value, float):
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        if isinstance(value, str):
+            try:
+                parsed = int(float(value.strip()))
+            except ValueError:
+                return default
+            return parsed if parsed > 0 else default
+        return default
 
     def cancel(self) -> None:
         with self._lock:

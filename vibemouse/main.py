@@ -4,7 +4,7 @@ import argparse
 
 from vibemouse.app import VoiceMouseApp
 from vibemouse.config import load_config
-from vibemouse.doctor import run_doctor
+from vibemouse.doctor import run_doctor, run_selftest
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -12,6 +12,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     _ = subparsers.add_parser("run", help="run the voice-input daemon")
     _ = subparsers.add_parser("doctor", help="run environment diagnostics")
+    _ = subparsers.add_parser("selftest", help="run microphone + edge-tts + ASR selftest")
     return parser
 
 
@@ -23,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     command = raw_command if isinstance(raw_command, str) else "run"
     if command == "doctor":
         return run_doctor()
+    if command == "selftest":
+        return run_selftest()
 
     config = load_config()
     app = VoiceMouseApp(config)

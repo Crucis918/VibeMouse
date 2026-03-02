@@ -120,6 +120,9 @@ class NoopSystemIntegration:
 
 
 class WindowsSystemIntegration(NoopSystemIntegration):
+    def is_text_input_focused(self) -> bool | None:
+        return True
+
     def paste_shortcuts(self, *, terminal_active: bool) -> tuple[tuple[str, str], ...]:
         if terminal_active:
             return (

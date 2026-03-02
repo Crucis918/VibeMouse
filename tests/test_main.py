@@ -11,12 +11,27 @@ class MainEntryTests(unittest.TestCase):
     def test_doctor_subcommand_dispatches_to_doctor(self) -> None:
         with (
             patch("vibemouse.main.run_doctor", return_value=7) as run_doctor,
+            patch("vibemouse.main.run_selftest") as run_selftest,
             patch("vibemouse.main.load_config") as load_config,
         ):
             rc = main(["doctor"])
 
         self.assertEqual(rc, 7)
         self.assertEqual(run_doctor.call_count, 1)
+        self.assertEqual(run_selftest.call_count, 0)
+        self.assertEqual(load_config.call_count, 0)
+
+    def test_selftest_subcommand_dispatches_to_selftest(self) -> None:
+        with (
+            patch("vibemouse.main.run_doctor") as run_doctor,
+            patch("vibemouse.main.run_selftest", return_value=9) as run_selftest,
+            patch("vibemouse.main.load_config") as load_config,
+        ):
+            rc = main(["selftest"])
+
+        self.assertEqual(rc, 9)
+        self.assertEqual(run_selftest.call_count, 1)
+        self.assertEqual(run_doctor.call_count, 0)
         self.assertEqual(load_config.call_count, 0)
 
     def test_default_invocation_runs_app(self) -> None:
